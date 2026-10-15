@@ -27,8 +27,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/
 
+# g4f 8.1.6 的 provider 需要较新的 curl_cffi,否则会报 BaseSession() unexpected keyword 'proxy'
+# (re_gpt 会把它钉在 0.5.9,这里强制升上去,re_gpt 那条链路本来也不在个人网关里用)
 RUN pip install --no-cache -r requirements.txt \
     && pip uninstall torch tensorflow transformers triton -y \
-    && rm -rf /usr/local/lib/python3.10/site-packages/nvidia
+    && rm -rf /usr/local/lib/python3.10/site-packages/nvidia \
+    && pip install --no-cache-dir --no-deps -U "curl_cffi>=0.7"
 
 CMD [ "python", "main.py" ]

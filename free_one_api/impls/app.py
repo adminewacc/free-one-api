@@ -24,6 +24,7 @@ from .adapter import hugchat
 from .adapter import qianwen
 from .adapter import re_gpt
 from .adapter import ds_web_agent
+from .adapter import openai_compatible
 
 from . import log
 from . import cfg as cfgutil
@@ -213,6 +214,7 @@ async def make_application(config_path: str) -> Application:
         "xw5xr6_revTongYi": qianwen.QianWenAdapter,
         "Zai-Kun_reverse-engineered-chatgpt": re_gpt.ReGPTAdapter,
         "ds-webagent/deepseek-web": ds_web_agent.DSWebAgentAdapter,
+        "openai/compatible": openai_compatible.OpenAICompatibleAdapter,
     }
 
     for adapter_name in adapter_config_mapping:

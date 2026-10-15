@@ -1,0 +1,18 @@
+# 个人网关:一条命令起服务,数据落在 ./data(渠道/Key/日志都在里面,记得备份)。
+#   docker compose up -d --build
+#   docker compose exec free-one-api python3 scripts/personal_setup.py
+services:
+  free-one-api:
+    build: .
+    image: personal-free-one-api:latest
+    container_name: free-one-api
+    restart: unless-stopped
+    ports:
+      # 只监听本机;要给局域网/外网用请改成 "3000:3000" 并自行加反代与鉴权。
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./data:/app/data
+      # 让容器内的初始化脚本可用(镜像里已带上 scripts/,这里挂载方便改)
+      - ./scripts:/app/scripts:ro
+    environment:
+      - DEBUG=false

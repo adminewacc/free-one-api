@@ -210,9 +210,50 @@ class ForwardManager(forwardmgr.AbsForwardManager):
         record.req_messages_length = req_msg_total_length
         
         t = int(time.time())
+
+        # 首块探测:返回 SSE 之前先取第一个 chunk;失败就打上 x-foa-fallback 标记,
+        # 让 query() 换下一个渠道重试(流一旦开始输出就无法回退了)。
+        stream_gen = chan.adapter.query(req)
+        primed = []
+
+        try:
+            primed.append(await stream_gen.__anext__())
+        except StopAsyncIteration:
+            pass
+        except Exception as e:
+            record.error = e
+            record.success = False
+            record.commit()
+
+            logging.warning("channel %s failed before first chunk: %s", chan.name, e)
+
+            return quart.Response(
+                "data: {}\n\ndata: [DONE]\n\n".format(json.dumps({
+                    "error": {
+                        "code": getattr(e, "code", None) or 502,
+                        "message": getattr(e, "message", None) or str(e),
+                        "type": getattr(e, "type", None) or "internal",
+                        "param": getattr(e, "param", None),
+                    }
+                })),
+                mimetype="text/event-stream",
+                headers={
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                    "x-foa-fallback": "1",
+                },
+            )
+
+        async def _chain():
+            for item in primed:
+                yield item
+            async for item in stream_gen:
+                yield item
+
         async def _gen():
             try:
-                async for resp in chan.adapter.query(req):
+                async for resp in _chain():
                     
                     if record.latency < 0:
                         record.latency = time.time() - before
@@ -422,39 +463,83 @@ class ForwardManager(forwardmgr.AbsForwardManager):
     ) -> quart.Response:
         
         id_suffix = "".join(random.choices(string.ascii_letters+string.digits, k=21))
-        chan: channel.Channel = await self.chanmgr.select_channel(
+        channels = await self.chanmgr.select_channels(
             ADAPTER_PATH,
             req,
             id_suffix
         )
-        
-        # find model replacement
-        if len(chan.model_mapping.keys()) > 0:
-            if req.model in chan.model_mapping.keys():
-                req.model = chan.model_mapping[req.model]
 
-        if chan is None:
-            pass
-        
-        resp_id = ""
-        resp_id += "{}".format(chan.id).zfill(3)
-        resp_id += chan.adapter.__class__.__name__[:5]
-        
-        resp_id += id_suffix
-        
         # Anthropic 客户端只发 x-api-key,不发 Authorization;这里只是日志用的取值,不能直接 .startswith。
         auth = quart.request.headers.get("Authorization") or quart.request.headers.get("x-api-key") or ""
         if auth.startswith("Bearer "):
             auth = auth[7:]
-        
-        query_info_str = f"type=query, path={path}, proto={proto}, model={req.model}, id_suffix={resp_id}, channel_name={chan.name}, channel_adpater={chan.adapter.__class__.__name__}, key={auth}"
-        
-        logging.info(query_info_str)
-        
-        if proto in (protocolmod.PROTOCOL_ANTHROPIC, protocolmod.PROTOCOL_RESPONSES):
-            return await self._protocol_query(chan, req, resp_id, proto)
 
-        if req.stream:
-            return await self.__stream_query(chan, req, resp_id)
-        else:
-            return await self.__non_stream_query(chan, req, resp_id)
+        # 不要把完整 key 写进日志(上游 open issue #144)。
+        masked_key = (auth[:8] + "..." + auth[-4:]) if len(auth) > 14 else ("***" if auth else "")
+
+        original_model = req.model
+        last_response = None
+
+        # 多渠道路由:按得分依次尝试,当前渠道在"首个 chunk 之前"失败就换下一个,
+        # 这样单个逆向渠道抖掉不会把请求整体打挂。
+        for index, chan in enumerate(channels):
+            req.model = original_model
+
+            # find model replacement
+            if chan.model_mapping and req.model in chan.model_mapping:
+                req.model = chan.model_mapping[req.model]
+
+            resp_id = ""
+            resp_id += "{}".format(chan.id).zfill(3)
+            resp_id += chan.adapter.__class__.__name__[:5]
+            resp_id += id_suffix
+
+            query_info_str = f"type=query, path={path}, proto={proto}, model={req.model}, id_suffix={resp_id}, channel_name={chan.name}, channel_adpater={chan.adapter.__class__.__name__}, key={masked_key}, attempt={index + 1}/{len(channels)}"
+
+            logging.info(query_info_str)
+
+            if proto in (protocolmod.PROTOCOL_ANTHROPIC, protocolmod.PROTOCOL_RESPONSES):
+                resp = await self._protocol_query(chan, req, resp_id, proto)
+            elif req.stream:
+                resp = await self.__stream_query(chan, req, resp_id)
+
+                if resp.headers.get("x-foa-fallback") == "1" and index < len(channels) - 1:
+                    logging.warning(
+                        "channel %s failed before first chunk, trying next channel",
+                        chan.name,
+                    )
+                    last_response = resp
+                    continue
+
+                req.model = original_model
+                return resp
+            else:
+                resp = await self.__non_stream_query(chan, req, resp_id)
+
+            if isinstance(resp, tuple):
+                body, status = resp[0], resp[1]
+            else:
+                body, status = resp, getattr(resp, "status_code", 200)
+
+            last_response = body
+
+            if status < 400:
+                req.model = original_model
+                return body
+
+            logging.warning(
+                "channel %s returned status %s, trying next channel",
+                chan.name,
+                status,
+            )
+
+        req.model = original_model
+
+        if last_response is None:
+            raise exceptions.QueryHandlingError(
+                404,
+                "channel_not_found",
+                "No suitable channel found. You may need to contact your admin or check the documentation at https://github.com/RockChinQ/free-one-api",
+            )
+
+        return last_response

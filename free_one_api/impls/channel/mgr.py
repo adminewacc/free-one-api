@@ -120,12 +120,12 @@ class ChannelManager(mgr.AbsChannelManager):
             await self.update_channel(chan)
         return latency
 
-    async def select_channel(
+    async def select_channels(
         self,
         path: str,
         req: request.Request,
         id_suffix: str="",
-    ) -> channel.Channel:
+    ) -> list:
         """Select a channel.
         
         Method here will filter channels and select the best one.
@@ -219,4 +219,23 @@ class ChannelManager(mgr.AbsChannelManager):
                 break
 
         random.seed(time.time())
-        return random.choice(max_score_channels)
+        random.shuffle(max_score_channels)
+
+        # 优先级最高的那几个先随机挑一个,其余按得分依次兜底。
+        ordered = list(max_score_channels)
+        for chan, _score in scores:
+            if chan not in ordered:
+                ordered.append(chan)
+
+        return ordered
+
+    async def select_channel(
+        self,
+        path: str,
+        req: request.Request,
+        id_suffix: str="",
+    ) -> channel.Channel:
+        """Select one channel (the highest ranked one)."""
+        ordered = await self.select_channels(path, req, id_suffix)
+
+        return ordered[0]
