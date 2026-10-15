@@ -1,4 +1,5 @@
 import json
+import logging
 import traceback
 
 import quart
@@ -9,6 +10,7 @@ from ...models.channel import mgr as channelmgr
 from ...models.key import mgr as apikeymgr
 from ...entities import channel, apikey
 from ...models import adapter
+from . import redact as redactor
 
 
 class WebAPIGroup(routergroup.APIGroup):
@@ -83,10 +85,14 @@ class WebAPIGroup(routergroup.APIGroup):
             try:
                 chan = await self.chanmgr.get_channel(chan_id)
                 
+                data = channel.Channel.dump_channel(chan)
+                # 出口脱敏:密钥只回显占位符,明文永远不出接口
+                data["adapter"]["config"] = redactor.redact(data["adapter"].get("config") or {})
+                
                 return quart.jsonify({
                     "code": 0,
                     "message": "ok",
-                    "data": channel.Channel.dump_channel(chan),
+                    "data": data,
                 })
             except Exception as e:
                 return quart.jsonify({
@@ -97,7 +103,18 @@ class WebAPIGroup(routergroup.APIGroup):
         @self.api("/channel/update/<int:chan_id>", ["PUT"], auth=True)
         async def channel_update(chan_id: int):
             try:
-                chan = channel.Channel.load_channel(await quart.request.get_json())
+                data = await quart.request.get_json()
+                
+                # 回显的占位符还原成库里已有的真实密钥(见 router/redact.py)
+                new_conf = (data.get("adapter") or {}).get("config") or {}
+                try:
+                    old = await self.chanmgr.get_channel(chan_id)
+                    old_conf = old.adapter.get_config() or {}
+                    data["adapter"]["config"] = redactor.merge_redacted(old_conf, new_conf)
+                except Exception:
+                    logging.warning("channel %s: cannot merge existing config, keeping request as-is", chan_id)
+                
+                chan = channel.Channel.load_channel(data)
                 chan.id = chan_id
                 await self.chanmgr.update_channel(chan)
                 
