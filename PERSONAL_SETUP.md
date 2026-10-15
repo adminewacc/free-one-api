@@ -95,6 +95,52 @@ curl -X POST http://localhost:3000/api/channel/create \
 Then click **test** on the channel. More providers = more headroom; the router load-balances
 across them by recent success/latency and fails over on errors.
 
+## unoRouter free models (optional, rotating model pool)
+
+[UnoRouter](https://unorouter.com) is an OpenAI-compatible aggregator with ~93 `:free` models —
+`gpt-4o:free`, `gemini-3.6-flash:free`, `claude-haiku-5-5:free`, `deepseek-v4.1-flash:free` — that
+never charge. Its catch: **1 request per minute per free model per account**, so a burst on one
+model gets `429` regardless of how much credit you have.
+
+The `openai/compatible` adapter handles that: set `free_model_pool` and it rotates through the pool
+whenever one model returns 429/503, instead of surfacing the error.
+
+```json
+{
+  "base_url": "https://api.unorouter.com/v1",
+  "api_key": "sk-...",
+  "models": ["unorouter-free"],
+  "pass_through_model": true,
+  "free_model_pool": ["deepseek-v4.1-flash:free", "gpt-4o:free", "gemini-3.6-flash:free",
+                      "glm-4.7-flash:free", "claude-haiku-5-5:free", "qwen3.6-plus:free"],
+  "max_model_rotations": 4
+}
+```
+
+Set `UNOROUTER_API_KEY` before running the setup script and it creates this channel for you —
+the key is read from the environment and never written into the repo.
+
+Verified behaviour: 5 parallel requests to `unorouter-free` all returned 200, with the log showing
+3 rotations (`deepseek-v4.1-flash:free → next`, `gemini-3.6-flash:free → next` twice) caused by the
+per-model cap.
+
+**Paid models stay blocked until you add balance** — they return
+`403 Your balance is empty (remaining: $0.000000)`. The only free ways to get balance:
+
+| Action | Reward |
+|---|---|
+| Link Discord to your account, claim on the verify panel | $0.25 once |
+| Boost their Discord server | $0.50 per boost, then every 30 days |
+| Vote on Top.gg / Discords.com / Discadia / DiscordServers.com | $0.013 per vote, ~every 12h per site |
+| Invite someone who joins | $0.025 each |
+| Reach Discord activity levels by chatting | $0.03 → $12.50, **$21.96 total** for all 9 levels |
+| Wear their server tag | $0.005 per full day |
+| Bug bounty (approved findings) | up to $50 each |
+| Affiliate commission on referred top-ups | up to $44 across levels |
+
+Reward balance **expires if unused**; purchased balance does not. Subscriptions
+($20/$50/$100 per month) give 2x credit and cut the waiting on free models.
+
 ## Real limits (read this)
 
 There is no such thing as an unlimited free LLM API. What you get here:

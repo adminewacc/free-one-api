@@ -54,6 +54,32 @@ CHANNELS = [
 ]
 
 
+def unorouter_channel():
+    """有 UNOROUTER_API_KEY 就顺带建一个 unoRouter 免费渠道(模型池轮换抗限流)。"""
+    key = os.environ.get("UNOROUTER_API_KEY", "").strip()
+    if not key:
+        return None
+    pool = [
+        "deepseek-v4.1-flash:free", "gpt-4o:free", "gemini-3.6-flash:free",
+        "glm-4.7-flash:free", "claude-haiku-5-5:free", "nemotron-3-super-120b-a12b:free",
+        "qwen3.6-plus:free", "gpt-oss-120b:free", "minimax-m2.7:free", "gemma-4-26b:free",
+    ]
+    return {
+        "name": "unorouter-free",
+        "adapter": {"type": "openai/compatible", "config": {
+            "base_url": "https://api.unorouter.com/v1",
+            "api_key": key,
+            "models": ["unorouter-free"],
+            "default_model": pool[0],
+            "pass_through_model": True,
+            "timeout_secs": 180,
+            # 上游按"每个免费模型 1 次/分钟"限流;撞 429 就池内换一个,见适配器 max_model_rotations
+            "free_model_pool": pool,
+            "max_model_rotations": 4,
+        }},
+    }
+
+
 def read_admin_token() -> str:
     if not os.path.exists(CONFIG_PATH):
         sys.exit("找不到 %s,先启动一次服务让它生成配置。" % CONFIG_PATH)
@@ -106,7 +132,12 @@ def main():
     channels = (call("/api/channel/list", token=admin).get("data") or [])
     by_name = {c["name"]: c for c in channels}
 
-    for spec in CHANNELS:
+    specs = list(CHANNELS)
+    extra = unorouter_channel()
+    if extra:
+        specs.append(extra)
+
+    for spec in specs:
         existed = by_name.get(spec["name"])
         body = {
             "id": existed["id"] if existed else 0,

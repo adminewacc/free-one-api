@@ -35,6 +35,9 @@ DEFAULTS = {
     "pass_through_model": False,
     "timeout_secs": 300,
     "extra_headers": {},
+    # 模型池:上游按"每个免费模型 1 次/分钟"限流时,撞到 429 就池内换一个再试。
+    "free_model_pool": [],
+    "max_model_rotations": 4,
 }
 
 
@@ -63,6 +66,7 @@ class OpenAICompatibleAdapter(llm.LLMLibAdapter):
         mapping = self._setting("model_map") or {}
         if isinstance(mapping, dict):
             models = list(mapping.keys()) + list(models or [])
+        models = list(self._free_model_pool()) + list(models or [])
         seen, out = set(), []
         for m in (models or DEFAULTS["models"]):
             if m not in seen:
@@ -154,9 +158,42 @@ class OpenAICompatibleAdapter(llm.LLMLibAdapter):
             return requested
         return str(self._setting("default_model") or requested)
 
-    def _build_payload(self, req: request.Request, stream: bool) -> dict:
+    def _free_model_pool(self) -> list:
+        pool = self.config.get("free_model_pool") if isinstance(self.config, dict) else None
+        if isinstance(pool, str):
+            pool = [m.strip() for m in pool.split(",") if m.strip()]
+        return [str(m).strip() for m in (pool or []) if str(m).strip()]
+
+    def _max_rotations(self) -> int:
+        try:
+            return max(1, int(self._setting("max_model_rotations")))
+        except (TypeError, ValueError):
+            return DEFAULTS["max_model_rotations"]
+
+    def _model_candidates(self, requested: str) -> list:
+        """返回本次请求要依次尝试的上游模型名。
+
+        配了模型池就按池轮换(客户端点的模型若在池里则排最前);没配则沿用
+        model_map / pass_through / default_model 的老逻辑。
+        """
+        pool = self._free_model_pool()
+
+        if pool:
+            head = [requested] if requested in pool else []
+            tail = [m for m in pool if m != requested]
+            random.shuffle(tail)
+            return (head + tail)[:self._max_rotations()]
+
+        return [self._resolve_model(requested)]
+
+    @staticmethod
+    def _is_retryable(err) -> bool:
+        """只有限流/上游过载值得换模型重试;参数错误换多少个模型都是一样的错。"""
+        return getattr(err, "status_code", None) in (429, 503)
+
+    def _build_payload(self, req: request.Request, stream: bool, model: str = None) -> dict:
         payload = {
-            "model": self._resolve_model(req.model),
+            "model": model or self._resolve_model(req.model),
             "messages": req.messages,
             "stream": stream,
         }
@@ -287,9 +324,9 @@ class OpenAICompatibleAdapter(llm.LLMLibAdapter):
 
     # ------------------------------------------------------------------ 主流程
 
-    async def query(self, req: request.Request) -> typing.AsyncGenerator[response.Response, None]:
-        resp_id = random.randint(0, 1000000000)
-        payload = self._build_payload(req, stream=True)
+    async def _stream_once(self, model: str, req: request.Request, resp_id: int) -> typing.AsyncGenerator[response.Response, None]:
+        """单次尝试:用一个指定模型打上游,原样产出 Response 流。"""
+        payload = self._build_payload(req, stream=True, model=model)
         timeout = aiohttp.ClientTimeout(
             total=self._timeout_secs(),
             sock_read=self._timeout_secs(),
@@ -300,7 +337,7 @@ class OpenAICompatibleAdapter(llm.LLMLibAdapter):
                     if upstream.status != 200:
                         body = await upstream.text()
                         raise exceptions.QueryHandlingError(
-                            502,
+                            upstream.status,
                             "upstream_error",
                             "上游 {} 返回 {}: {}".format(self._url(), upstream.status, body[:500]),
                             type="api_error",
@@ -352,3 +389,47 @@ class OpenAICompatibleAdapter(llm.LLMLibAdapter):
                 "调用上游 {} 失败: {}".format(self._url(), e),
                 type="api_error",
             ) from e
+
+    async def query(self, req: request.Request) -> typing.AsyncGenerator[response.Response, None]:
+        """按模型池轮换:某个免费模型撞到 429 就换下一个,而不是把错误直接丢给调用方。"""
+        resp_id = random.randint(0, 1000000000)
+        candidates = self._model_candidates(req.model)
+        last_error = None
+
+        for index, model in enumerate(candidates):
+            gen = self._stream_once(model, req, resp_id)
+            first = None
+
+            try:
+                first = await gen.__anext__()
+            except StopAsyncIteration:
+                first = None
+            except Exception as e:
+                last_error = e
+                has_next = index < len(candidates) - 1
+                if has_next and self._is_retryable(e):
+                    logging.warning(
+                        "openai/compatible: %s 限流/过载(%s),换下一个模型重试",
+                        model,
+                        getattr(e, "code", None) or e,
+                    )
+                    continue
+                raise
+
+            if first is not None:
+                yield first
+
+            async for item in gen:
+                yield item
+
+            return
+
+        if last_error is not None:
+            raise last_error
+
+        raise exceptions.QueryHandlingError(
+            502,
+            "upstream_unreachable",
+            "上游没有任何可用模型",
+            type="api_error",
+        )
